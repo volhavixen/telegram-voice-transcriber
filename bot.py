@@ -36,6 +36,9 @@ BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 # server would allow). Telegram, not this constant, has the final say — this is only used
 # to reject obviously-too-large files early with a clear message.
 MTPROTO_DOWNLOAD_LIMIT = 2000 * 1024 * 1024
+# How long we're willing to wait for the MTProto client to connect at startup before
+# giving up on large-file support for this run instead of blocking the whole bot forever.
+MTPROTO_START_TIMEOUT = 30
 
 LARGE_FILE_DISABLED_MESSAGE = (
     "Файл больше 20 МБ — обычный Telegram Bot API не позволяет ботам скачивать такие файлы.\n"
@@ -75,6 +78,10 @@ WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small").strip()
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu").strip()
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip()
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "").strip() or None
+# 0 lets CTranslate2 pick a sensible default. Raise this on a beefy multi-core server to
+# speed up each individual transcription (this bot only ever runs one at a time, so more
+# threads per job — rather than more concurrent jobs — is where the CPU budget should go).
+WHISPER_CPU_THREADS = env_int("WHISPER_CPU_THREADS", 0, minimum=0)
 MAX_AUDIO_DURATION = env_int("MAX_AUDIO_DURATION", 1800)
 MAX_QUEUE_SIZE = env_int("MAX_QUEUE_SIZE", 20)
 
@@ -111,6 +118,11 @@ if LARGE_FILE_SUPPORT:
         in_memory=True,
     )
 
+# Kicked off in main() right at startup so the model is usually already loaded (or at least
+# well on its way) by the time the first user sends audio, instead of only starting on the
+# first job and making that one user wait through the full load time.
+model_load_task: asyncio.Task[WhisperModel] | None = None
+
 
 @dataclass(slots=True)
 class TranscriptionJob:
@@ -123,6 +135,16 @@ def is_allowed(user_id: int | None) -> bool:
     return user_id is not None and (not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS)
 
 
+def large_file_support_active() -> bool:
+    """Whether the MTProto fallback is actually usable right now.
+
+    LARGE_FILE_SUPPORT only reflects whether API_ID/API_HASH were configured; pyro_client
+    is additionally set back to None if the MTProto client failed to connect at startup
+    (see main()). Both need to hold for the fallback to actually work.
+    """
+    return LARGE_FILE_SUPPORT and pyro_client is not None
+
+
 def check_file_size(file_size: int | None) -> None:
     """Reject obviously too-large files up front, when Telegram reports a size for them."""
     if file_size is None:
@@ -132,7 +154,7 @@ def check_file_size(file_size: int | None) -> None:
             f"Файл больше {MTPROTO_DOWNLOAD_LIMIT // (1024 * 1024)} МБ — "
             "Telegram не позволяет ботам скачивать такие файлы."
         )
-    if file_size > BOT_API_DOWNLOAD_LIMIT and not LARGE_FILE_SUPPORT:
+    if file_size > BOT_API_DOWNLOAD_LIMIT and not large_file_support_active():
         raise FileTooLargeError(LARGE_FILE_DISABLED_MESSAGE)
 
 
@@ -140,7 +162,7 @@ async def download_audio(media, tmp_path: Path) -> None:
     """Download media into tmp_path, falling back to MTProto for files over 20 MB.
 
     The regular Bot API (bot.get_file/download_file) refuses files bigger than 20 MB with
-    TelegramEntityTooLarge. When API_ID/API_HASH are configured, we retry the same file
+    TelegramEntityTooLarge. When the MTProto fallback is available, we retry the same file
     through a Pyrogram/MTProto client instead, which Telegram allows up to ~2 GB for bots.
     """
     try:
@@ -148,7 +170,7 @@ async def download_audio(media, tmp_path: Path) -> None:
         await bot.download_file(telegram_file.file_path, destination=tmp_path)
         return
     except TelegramEntityTooLarge as error:
-        if not LARGE_FILE_SUPPORT or pyro_client is None:
+        if not large_file_support_active():
             raise FileTooLargeError(LARGE_FILE_DISABLED_MESSAGE) from error
 
     log.info("Файл больше 20 МБ, скачиваю через MTProto (API_ID/API_HASH)")
@@ -159,18 +181,29 @@ async def download_audio(media, tmp_path: Path) -> None:
 
 def load_model() -> WhisperModel:
     log.info(
-        "Загружаю Whisper: size=%s device=%s compute_type=%s",
+        "Загружаю Whisper: size=%s device=%s compute_type=%s cpu_threads=%s",
         WHISPER_MODEL_SIZE,
         WHISPER_DEVICE,
         WHISPER_COMPUTE_TYPE,
+        WHISPER_CPU_THREADS or "auto",
     )
     loaded_model = WhisperModel(
         WHISPER_MODEL_SIZE,
         device=WHISPER_DEVICE,
         compute_type=WHISPER_COMPUTE_TYPE,
+        cpu_threads=WHISPER_CPU_THREADS,
     )
     log.info("Модель загружена")
     return loaded_model
+
+
+async def get_model() -> WhisperModel:
+    """Return the shared Whisper model, starting the load on first use if it hasn't
+    already been kicked off by main()."""
+    global model_load_task
+    if model_load_task is None:
+        model_load_task = asyncio.create_task(asyncio.to_thread(load_model), name="whisper-model-loader")
+    return await model_load_task
 
 
 def transcribe_sync(model: WhisperModel, audio_path: Path) -> str:
@@ -179,6 +212,10 @@ def transcribe_sync(model: WhisperModel, audio_path: Path) -> str:
         language=WHISPER_LANGUAGE,
         vad_filter=True,
         beam_size=1,
+        # Without this, faster-whisper feeds each segment's text back in as a prompt for the
+        # next one; on noisy or silent stretches that can snowball into repeated phrases
+        # ("hallucination loops"). Disabling it also skips that extra conditioning work.
+        condition_on_previous_text=False,
     )
     return " ".join(segment.text.strip() for segment in segments).strip()
 
@@ -208,14 +245,13 @@ async def send_long_text(message: Message, text: str) -> None:
 
 
 async def worker() -> None:
-    model: WhisperModel | None = None
     while True:
         job = await transcription_queue.get()
         try:
             await job.status.edit_text("Распознаю голосовое сообщение… ⏳")
-            if model is None:
+            if model_load_task is None or not model_load_task.done():
                 await job.status.edit_text("Загружаю модель распознавания… Первый запуск дольше обычного ⏳")
-                model = await asyncio.to_thread(load_model)
+            model = await get_model()
             text = await asyncio.to_thread(transcribe_sync, model, job.audio_path)
             await job.status.delete()
             await send_long_text(job.message, text)
@@ -298,9 +334,21 @@ async def on_voice(message: Message) -> None:
 
 
 async def main() -> None:
+    global model_load_task, pyro_client
+
+    model_load_task = asyncio.create_task(asyncio.to_thread(load_model), name="whisper-model-loader")
     worker_task = asyncio.create_task(worker(), name="transcription-worker")
+
     if pyro_client is not None:
-        await pyro_client.start()
+        try:
+            await asyncio.wait_for(pyro_client.start(), timeout=MTPROTO_START_TIMEOUT)
+        except Exception:
+            log.exception(
+                "Не удалось подключиться через MTProto — поддержка файлов больше 20 МБ "
+                "отключена для этого запуска. Проверьте API_ID/API_HASH в .env."
+            )
+            pyro_client = None
+
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
