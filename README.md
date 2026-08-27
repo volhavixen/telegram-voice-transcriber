@@ -1,5 +1,9 @@
 # Telegram Voice Transcriber
 
+![License](https://img.shields.io/badge/license-MIT-green)
+![Python](https://img.shields.io/badge/python-3.10--3.14-blue)
+![Docker](https://img.shields.io/badge/docker-ready-blue)
+
 Личный Telegram-бот для локальной расшифровки голосовых и аудиосообщений.
 Аудио обрабатывается на компьютере или сервере владельца через
 `faster-whisper`: платный API и отправка записей в LLM не используются.
