@@ -8,11 +8,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramUnauthorizedError
+from aiogram.exceptions import TelegramEntityTooLarge, TelegramUnauthorizedError
 from aiogram.filters import CommandStart
 from aiogram.types import Message
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
+
+# "pyrogram" is imported from the "kurigram" package (see requirements.txt) — kurigram is an
+# actively maintained drop-in replacement for the original, now-stale Pyrogram library, and it
+# keeps the same "pyrogram" module name on purpose.
+from pyrogram import Client as PyrogramClient
 
 load_dotenv()
 
@@ -24,6 +29,23 @@ SUPPORTED_AUDIO_EXTENSIONS = {
     ".aac", ".flac", ".m4a", ".mp3", ".mp4", ".mpeg", ".mpga",
     ".ogg", ".opus", ".wav", ".webm", ".wma",
 }
+
+# The regular Telegram Bot API refuses to hand bots files bigger than this.
+BOT_API_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+# Telegram's current ceiling for bots downloading over MTProto (same as a local Bot API
+# server would allow). Telegram, not this constant, has the final say — this is only used
+# to reject obviously-too-large files early with a clear message.
+MTPROTO_DOWNLOAD_LIMIT = 2000 * 1024 * 1024
+
+LARGE_FILE_DISABLED_MESSAGE = (
+    "Файл больше 20 МБ — обычный Telegram Bot API не позволяет ботам скачивать такие файлы.\n"
+    "Чтобы бот мог их обрабатывать, администратору нужно получить API_ID и API_HASH на "
+    "https://my.telegram.org и указать их в .env (см. README, раздел «Файлы больше 20 МБ»)."
+)
+
+
+class FileTooLargeError(Exception):
+    """Raised when a file cannot be downloaded within Telegram's or our own limits."""
 
 
 def env_int(name: str, default: int, minimum: int = 1) -> int:
@@ -56,9 +78,38 @@ WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "").strip() or None
 MAX_AUDIO_DURATION = env_int("MAX_AUDIO_DURATION", 1800)
 MAX_QUEUE_SIZE = env_int("MAX_QUEUE_SIZE", 20)
 
+API_ID_RAW = os.getenv("API_ID", "").strip()
+API_HASH = os.getenv("API_HASH", "").strip()
+if bool(API_ID_RAW) != bool(API_HASH):
+    raise SystemExit(
+        "Укажите либо оба API_ID и API_HASH (для файлов больше 20 МБ), либо оставьте оба пустыми."
+    )
+LARGE_FILE_SUPPORT = bool(API_ID_RAW and API_HASH)
+if LARGE_FILE_SUPPORT:
+    try:
+        API_ID = int(API_ID_RAW)
+    except ValueError as error:
+        raise SystemExit("API_ID должен быть числом. Получите его на https://my.telegram.org.") from error
+    log.info("Поддержка файлов больше 20 МБ включена (заданы API_ID и API_HASH)")
+else:
+    API_ID = None
+    log.info(
+        "Поддержка файлов больше 20 МБ выключена — заполните API_ID и API_HASH в .env, чтобы включить"
+    )
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 transcription_queue: asyncio.Queue["TranscriptionJob"] = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+
+pyro_client: PyrogramClient | None = None
+if LARGE_FILE_SUPPORT:
+    pyro_client = PyrogramClient(
+        name="large_file_helper",
+        api_id=API_ID,
+        api_hash=API_HASH,
+        bot_token=BOT_TOKEN,
+        in_memory=True,
+    )
 
 
 @dataclass(slots=True)
@@ -70,6 +121,40 @@ class TranscriptionJob:
 
 def is_allowed(user_id: int | None) -> bool:
     return user_id is not None and (not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS)
+
+
+def check_file_size(file_size: int | None) -> None:
+    """Reject obviously too-large files up front, when Telegram reports a size for them."""
+    if file_size is None:
+        return
+    if file_size > MTPROTO_DOWNLOAD_LIMIT:
+        raise FileTooLargeError(
+            f"Файл больше {MTPROTO_DOWNLOAD_LIMIT // (1024 * 1024)} МБ — "
+            "Telegram не позволяет ботам скачивать такие файлы."
+        )
+    if file_size > BOT_API_DOWNLOAD_LIMIT and not LARGE_FILE_SUPPORT:
+        raise FileTooLargeError(LARGE_FILE_DISABLED_MESSAGE)
+
+
+async def download_audio(media, tmp_path: Path) -> None:
+    """Download media into tmp_path, falling back to MTProto for files over 20 MB.
+
+    The regular Bot API (bot.get_file/download_file) refuses files bigger than 20 MB with
+    TelegramEntityTooLarge. When API_ID/API_HASH are configured, we retry the same file
+    through a Pyrogram/MTProto client instead, which Telegram allows up to ~2 GB for bots.
+    """
+    try:
+        telegram_file = await bot.get_file(media.file_id)
+        await bot.download_file(telegram_file.file_path, destination=tmp_path)
+        return
+    except TelegramEntityTooLarge as error:
+        if not LARGE_FILE_SUPPORT or pyro_client is None:
+            raise FileTooLargeError(LARGE_FILE_DISABLED_MESSAGE) from error
+
+    log.info("Файл больше 20 МБ, скачиваю через MTProto (API_ID/API_HASH)")
+    downloaded = await pyro_client.download_media(media.file_id, file_name=str(tmp_path))
+    if downloaded is None:
+        raise RuntimeError("MTProto-загрузка не вернула файл (download_media() -> None)")
 
 
 def load_model() -> WhisperModel:
@@ -179,20 +264,23 @@ async def on_voice(message: Message) -> None:
     if duration > MAX_AUDIO_DURATION:
         await message.reply(f"Аудио слишком длинное. Максимум: {MAX_AUDIO_DURATION // 60} мин.")
         return
+    try:
+        check_file_size(getattr(media, "file_size", None))
+    except FileTooLargeError as error:
+        await message.reply(str(error))
+        return
     if transcription_queue.full():
         await message.reply("Очередь переполнена. Попробуйте отправить аудио немного позже.")
         return
 
     position = transcription_queue.qsize() + 1
     status = await message.reply(f"Принято. Позиция в очереди: {position} ⏳")
-    tmp_path: Path | None = None
+    suffix = Path(file_name).suffix or ".ogg"
+    fd, tmp_path_str = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    tmp_path = Path(tmp_path_str)
     try:
-        telegram_file = await bot.get_file(media.file_id)
-        suffix = Path(file_name).suffix or Path(telegram_file.file_path or "audio.ogg").suffix or ".ogg"
-        fd, tmp_path_str = tempfile.mkstemp(suffix=suffix)
-        os.close(fd)
-        tmp_path = Path(tmp_path_str)
-        await bot.download_file(telegram_file.file_path, destination=tmp_path)
+        await download_audio(media, tmp_path)
         await transcription_queue.put(TranscriptionJob(message, status, tmp_path))
         log.info(
             "Аудио получено: user=%s duration=%ss queue=%d",
@@ -200,21 +288,27 @@ async def on_voice(message: Message) -> None:
             duration or "unknown",
             transcription_queue.qsize(),
         )
+    except FileTooLargeError as error:
+        tmp_path.unlink(missing_ok=True)
+        await status.edit_text(str(error))
     except Exception:
-        if tmp_path is not None:
-            tmp_path.unlink(missing_ok=True)
+        tmp_path.unlink(missing_ok=True)
         log.exception("Ошибка при скачивании аудио")
         await status.edit_text("Не удалось скачать аудио 😕 Попробуйте ещё раз.")
 
 
 async def main() -> None:
     worker_task = asyncio.create_task(worker(), name="transcription-worker")
+    if pyro_client is not None:
+        await pyro_client.start()
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:
         worker_task.cancel()
         await asyncio.gather(worker_task, return_exceptions=True)
+        if pyro_client is not None:
+            await pyro_client.stop()
         await bot.session.close()
 
 
