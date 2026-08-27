@@ -1,0 +1,15 @@
+services:
+  voice-transcriber-bot:
+    build: .
+    container_name: voice-transcriber-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    init: true
+    volumes:
+      # Кешируем скачанную модель Whisper между перезапусками контейнера,
+      # чтобы не скачивать её (сотни МБ) заново каждый раз.
+      - whisper-cache:/root/.cache
+
+volumes:
+  whisper-cache:
