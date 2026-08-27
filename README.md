@@ -1,6 +1,6 @@
 # Telegram Voice Transcriber
 
-![Tests](https://github.com/ВАШ_ЮЗЕРНЕЙМ/telegram-voice-transcriber/actions/workflows/tests.yml/badge.svg)
+![Tests](https://github.com/volhavixen/telegram-voice-transcriber/actions/workflows/tests.yml/badge.svg)
 ![License](https://img.shields.io/badge/license-MIT-green)
 ![Python](https://img.shields.io/badge/python-3.10--3.14-blue)
 ![Docker](https://img.shields.io/badge/docker-ready-blue)
