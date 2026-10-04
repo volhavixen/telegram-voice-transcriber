@@ -82,6 +82,7 @@ WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "").strip() or None
 # speed up each individual transcription (this bot only ever runs one at a time, so more
 # threads per job — rather than more concurrent jobs — is where the CPU budget should go).
 WHISPER_CPU_THREADS = env_int("WHISPER_CPU_THREADS", 0, minimum=0)
+WHISPER_BEAM_SIZE = env_int("WHISPER_BEAM_SIZE", 1, minimum=1)
 MAX_AUDIO_DURATION = env_int("MAX_AUDIO_DURATION", 1800)
 MAX_QUEUE_SIZE = env_int("MAX_QUEUE_SIZE", 20)
 
@@ -211,7 +212,7 @@ def transcribe_sync(model: WhisperModel, audio_path: Path) -> str:
         str(audio_path),
         language=WHISPER_LANGUAGE,
         vad_filter=True,
-        beam_size=1,
+        beam_size=WHISPER_BEAM_SIZE,
         # Without this, faster-whisper feeds each segment's text back in as a prompt for the
         # next one; on noisy or silent stretches that can snowball into repeated phrases
         # ("hallucination loops"). Disabling it also skips that extra conditioning work.

@@ -33,3 +33,31 @@ jobs:
 
       - name: Run tests
         run: python -m unittest discover -s tests -v
+
+  deploy:
+    name: Deploy to VPS
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.VPS_DEPLOY_ENABLED == 'true'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          VPS_DEPLOY_KEY: ${{ secrets.VPS_DEPLOY_KEY }}
+        run: |
+          test -n "$VPS_DEPLOY_KEY"
+          install -d -m 0700 ~/.ssh
+          printf '%s\n' "$VPS_DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 0600 ~/.ssh/id_ed25519
+          printf '%s\n' '199.68.199.130 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJ7++IdpyjyT24Ey9Qwhskz9w3L/WDPmvqJpKodks2B0' > ~/.ssh/known_hosts
+
+      - name: Update application and restart service
+        run: |
+          scp bot.py requirements.txt telegramdeploy@199.68.199.130:/opt/telegram-voice-transcriber/
+          scp -r deploy telegramdeploy@199.68.199.130:/opt/telegram-voice-transcriber/
+          ssh telegramdeploy@199.68.199.130 'cd /opt/telegram-voice-transcriber && .venv/bin/python -m pip install --no-cache-dir -r requirements.txt && sudo /usr/bin/systemctl restart telegram-voice-transcriber.service && sudo /usr/bin/systemctl is-active telegram-voice-transcriber.service'

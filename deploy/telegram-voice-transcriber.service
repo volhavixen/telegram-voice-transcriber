@@ -14,6 +14,7 @@ ExecStart=/opt/telegram-voice-transcriber/.venv/bin/python -u /opt/telegram-voic
 Restart=always
 RestartSec=10
 KillSignal=SIGINT
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=multi-user.target
