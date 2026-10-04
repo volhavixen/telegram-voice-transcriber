@@ -1,0 +1,19 @@
+[Unit]
+Description=Telegram Voice Transcriber
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=telegrambot
+Group=telegrambot
+WorkingDirectory=/opt/telegram-voice-transcriber
+Environment=HF_HOME=/var/lib/telegram-voice-transcriber/huggingface
+StateDirectory=telegram-voice-transcriber
+ExecStart=/opt/telegram-voice-transcriber/.venv/bin/python -u /opt/telegram-voice-transcriber/bot.py
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+
+[Install]
+WantedBy=multi-user.target

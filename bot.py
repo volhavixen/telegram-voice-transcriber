@@ -74,7 +74,7 @@ if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN не задан. Скопируйте .env.example в .env и заполните токен.")
 
 ALLOWED_USER_IDS = parse_user_ids(os.getenv("ALLOWED_USER_IDS", ""))
-WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "small").strip()
+WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny").strip()
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu").strip()
 WHISPER_COMPUTE_TYPE = os.getenv("WHISPER_COMPUTE_TYPE", "int8").strip()
 WHISPER_LANGUAGE = os.getenv("WHISPER_LANGUAGE", "").strip() or None
@@ -350,7 +350,7 @@ async def main() -> None:
             pyro_client = None
 
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.delete_webhook(drop_pending_updates=False)
         await dp.start_polling(bot)
     finally:
         worker_task.cancel()
