@@ -1,4 +1,5 @@
 aiogram==3.30.0
 faster-whisper==1.2.1
+av<19
 python-dotenv==1.2.2
 kurigram==2.2.25
