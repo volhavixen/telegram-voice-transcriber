@@ -5,10 +5,8 @@
 ![Python](https://img.shields.io/badge/python-3.10--3.14-blue)
 ![Docker](https://img.shields.io/badge/docker-ready-blue)
 
-Telegram-бот для расшифровки голосовых и аудиосообщений на собственном VPS.
-Попробовать: [@thisIsTranscriptBot](https://t.me/thisIsTranscriptBot) (доступ
-ограничен списком пользователей). Распознавание выполняет `faster-whisper` на
-CPU; платный API и LLM не используются.
+Личный Telegram-бот для расшифровки голосовых и аудиосообщений на собственном VPS.
+Распознавание выполняет `faster-whisper` на CPU; платный API и LLM не используются.
 
 **Рабочее развёртывание:** Ubuntu VPS → `systemd` → опрос Telegram Bot API.
 GitHub Actions запускает тесты и доставляет изменения на VPS после успешного
@@ -32,8 +30,7 @@ flowchart LR
   документ: WAV, MP3, M4A, OGG/OPUS, FLAC, AAC, WMA, WEBM, MP4.
 - Распознаёт на VPS через `faster-whisper`; аудио скачивается из Telegram на
   VPS и не передаётся в сторонний API или LLM.
-- Ограничение доступа по списку Telegram user_id (`ALLOWED_USER_IDS`) или
-  открытый режим для всех, кто напишет боту.
+- Ограничение доступа по списку Telegram user_id (`ALLOWED_USER_IDS`).
 - Очередь сообщений: файлы обрабатываются по одному, чтобы не исчерпать RAM,
   а пользователь видит свою позицию в очереди и статус («загружаю модель»,
   «распознаю…»).
