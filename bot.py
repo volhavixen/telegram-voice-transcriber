@@ -108,6 +108,7 @@ else:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 transcription_queue: asyncio.Queue["TranscriptionJob"] = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+worker_busy = False
 
 pyro_client: PyrogramClient | None = None
 if LARGE_FILE_SUPPORT:
@@ -130,6 +131,7 @@ class TranscriptionJob:
     message: Message
     status: Message
     audio_path: Path
+    position: int
 
 
 def is_allowed(user_id: int | None) -> bool:
@@ -237,25 +239,29 @@ def split_text(text: str, limit: int = MAX_TELEGRAM_MESSAGE_LEN) -> list[str]:
     return chunks
 
 
-async def send_long_text(message: Message, text: str) -> None:
+async def send_long_text(message: Message, status: Message, text: str) -> None:
     if not text:
-        await message.reply("Не удалось распознать речь в этом сообщении 🤔")
+        await status.edit_text("Не удалось распознать речь в этом сообщении 🤔")
         return
-    for chunk in split_text(text):
+    chunks = split_text(text)
+    await status.edit_text(chunks[0])
+    for chunk in chunks[1:]:
         await message.reply(chunk)
 
 
 async def worker() -> None:
+    global worker_busy
     while True:
         job = await transcription_queue.get()
+        worker_busy = True
         try:
-            await job.status.edit_text("Распознаю голосовое сообщение… ⏳")
+            if job.position > 1:
+                await job.status.edit_text("Распознаю голосовое сообщение… ⏳")
             if model_load_task is None or not model_load_task.done():
                 await job.status.edit_text("Загружаю модель распознавания… Первый запуск дольше обычного ⏳")
             model = await get_model()
             text = await asyncio.to_thread(transcribe_sync, model, job.audio_path)
-            await job.status.delete()
-            await send_long_text(job.message, text)
+            await send_long_text(job.message, job.status, text)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -265,6 +271,7 @@ async def worker() -> None:
             except Exception:
                 log.exception("Не удалось обновить сообщение о статусе")
         finally:
+            worker_busy = False
             job.audio_path.unlink(missing_ok=True)
             transcription_queue.task_done()
 
@@ -310,15 +317,19 @@ async def on_voice(message: Message) -> None:
         await message.reply("Очередь переполнена. Попробуйте отправить аудио немного позже.")
         return
 
-    position = transcription_queue.qsize() + 1
-    status = await message.reply(f"Принято. Позиция в очереди: {position} ⏳")
+    position = transcription_queue.qsize() + int(worker_busy) + 1
+    status_text = (
+        "Распознаю голосовое сообщение… ⏳"
+        if position == 1 else f"Принято. Позиция в очереди: {position} ⏳"
+    )
+    status = await message.reply(status_text)
     suffix = Path(file_name).suffix or ".ogg"
     fd, tmp_path_str = tempfile.mkstemp(suffix=suffix)
     os.close(fd)
     tmp_path = Path(tmp_path_str)
     try:
         await download_audio(media, tmp_path)
-        await transcription_queue.put(TranscriptionJob(message, status, tmp_path))
+        await transcription_queue.put(TranscriptionJob(message, status, tmp_path, position))
         log.info(
             "Аудио получено: user=%s duration=%ss queue=%d",
             user_id,
