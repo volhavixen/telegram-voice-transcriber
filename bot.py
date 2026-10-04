@@ -1,4 +1,4 @@
-"""Telegram bot that transcribes voice and audio messages locally."""
+"""Telegram bot that transcribes voice and audio on its own host."""
 
 import asyncio
 import logging
@@ -276,7 +276,7 @@ async def on_start(message: Message) -> None:
         return
     await message.reply(
         "Привет! Пришлите или перешлите мне голосовое или аудиосообщение — "
-        "я локально расшифрую его в текст."
+        "я расшифрую его на сервере и пришлю текст."
     )
 
 
